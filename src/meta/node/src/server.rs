@@ -90,6 +90,7 @@ use crate::barrier::BarrierScheduler;
 use crate::controller::SqlMetaStore;
 use crate::controller::system_param::SystemParamsController;
 use crate::hummock::HummockManager;
+use crate::manager::iceberg_v3_sink::IcebergV3SinkManager;
 use crate::manager::sink_coordination::SinkCoordinatorManager;
 use crate::manager::{IdleManager, MetaOpts, MetaSrvEnv};
 use crate::rpc::election::sql::{MySqlDriver, PostgresDriver, SqlBackendElectionClient};
@@ -464,6 +465,13 @@ pub async fn start_service_as_election_leader(
     // TODO(shutdown): remove this as there's no need to gracefully shutdown some of these sub-tasks.
     let mut sub_tasks = vec![shutdown_handle];
 
+    let (iceberg_v3_sink_manager, v3_sink_shutdown) = IcebergV3SinkManager::start_worker(
+        env.meta_store_ref().conn.clone(),
+        env.await_tree_reg().clone(),
+    );
+    tracing::info!("IcebergV3SinkManager started");
+    sub_tasks.push(v3_sink_shutdown);
+
     let iceberg_compactor_manager = Arc::new(IcebergCompactorManager::new());
 
     // TODO: introduce compactor event stream handler to handle iceberg compaction events.
@@ -507,6 +515,7 @@ pub async fn start_service_as_election_leader(
         hummock_manager.clone(),
         source_manager.clone(),
         sink_manager.clone(),
+        iceberg_v3_sink_manager.clone(),
         scale_controller.clone(),
         barrier_scheduler.clone(),
         refresh_manager.clone(),
@@ -550,6 +559,7 @@ pub async fn start_service_as_election_leader(
         meta_metrics.clone(),
         iceberg_compaction_mgr.clone(),
         barrier_scheduler.clone(),
+        iceberg_v3_sink_manager.clone(),
     )
     .await;
 

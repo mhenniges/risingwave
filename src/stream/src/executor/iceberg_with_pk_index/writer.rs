@@ -16,17 +16,19 @@ use anyhow::Context;
 use iceberg::writer::PositionDeleteInput;
 use risingwave_common::array::DataChunk;
 use risingwave_common::array::stream_record::Record;
+use risingwave_common::id::SinkId;
 use risingwave_common::row::{Project, RowExt};
 use risingwave_common::util::chunk_coalesce::DataChunkBuilder;
 use risingwave_common::util::iter_util::ZipEqFast;
 use risingwave_pb::connector_service::SinkMetadata;
+use risingwave_pb::stream_service::PbIcebergV3SinkRole;
 use risingwave_storage::StateStore;
 
 use crate::common::change_buffer::output_kind;
 use crate::common::compact_chunk::{InconsistencyBehavior, compact_chunk_inline};
 use crate::executor::prelude::*;
+use crate::task::LocalBarrierManager;
 
-pub type IcebergWriterFlushOutput = SinkMetadata;
 type PkRow<'a> = Project<'a, RowRef<'a>>;
 
 fn new_chunk_builder(chunk_size: usize) -> DataChunkBuilder {
@@ -52,9 +54,9 @@ pub trait IcebergWriter: Send + 'static {
         chunk: DataChunk,
     ) -> StreamExecutorResult<Vec<PositionDeleteInput>>;
 
-    /// Flush current data files on barrier. Returns the written data files
-    /// and each file's partition information (if partitioned).
-    async fn flush(&mut self) -> StreamExecutorResult<Option<IcebergWriterFlushOutput>>;
+    /// Flush current data files on barrier. Returns serialized commit metadata,
+    /// or `None` if no data was written since the last flush.
+    async fn flush(&mut self) -> StreamExecutorResult<Option<SinkMetadata>>;
 }
 
 /// Writer Executor for Iceberg V3 Sink with PK index
@@ -88,6 +90,8 @@ where
     delete_position_buffer: Option<DataChunkBuilder>,
     chunk_size: usize,
     pk_matched: bool,
+    sink_id: SinkId,
+    local_barrier_manager: LocalBarrierManager,
 }
 
 impl<S, W> WriterExecutor<S, W>
@@ -104,6 +108,8 @@ where
         writer: W,
         chunk_size: usize,
         pk_matched: bool,
+        sink_id: SinkId,
+        local_barrier_manager: LocalBarrierManager,
     ) -> Self {
         Self {
             ctx,
@@ -114,6 +120,8 @@ where
             delete_position_buffer: None,
             chunk_size,
             pk_matched,
+            sink_id,
+            local_barrier_manager,
         }
     }
 
@@ -156,10 +164,9 @@ where
     // chunk in the same checkpoint observes earlier writes/deletes via the state table.
     #[try_stream(ok = DataChunk, error = StreamExecutorError)]
     async fn process_chunk(&mut self, chunk: StreamChunk) {
-        // PK uniqueness within a chunk is not guaranteed by upstream (this executor sits in front
-        // of `SinkExecutor` and does not inherit its compaction). Run it ourselves so the loop
-        // below can stay linear. `Warn` matches `SinkExecutor`'s policy: tolerate inconsistent
-        // upstream PK rather than panic.
+        // PK uniqueness within a chunk is not guaranteed by upstream. Run compaction ourselves so
+        // the loop below can stay linear. `Warn` tolerates inconsistent upstream PK rather than
+        // panic.
         let chunk = compact_chunk_inline::<{ output_kind::RETRACT }>(
             chunk,
             &self.pk_indices,
@@ -246,6 +253,18 @@ where
         // Consume the first barrier.
         let barrier = expect_first_barrier(&mut input).await?;
         let first_epoch = barrier.epoch;
+
+        // Report a one-shot `None` metadata at the first barrier so that the meta-side
+        // commit coordinator can drive any pending recovery iceberg commits to
+        // completion before this executor starts writing actual data.
+        self.local_barrier_manager.report_iceberg_v3_sink_metadata(
+            first_epoch,
+            self.sink_id,
+            self.ctx.id,
+            PbIcebergV3SinkRole::Writer,
+            None,
+        );
+
         yield Message::Barrier(barrier);
         self.pk_index_state_table.init_epoch(first_epoch).await?;
 
@@ -268,12 +287,22 @@ where
                         yield Message::Chunk(chunk.into());
                     }
 
-                    let _metadata = self.writer.flush().await?.unwrap_or_default();
+                    let metadata = self.writer.flush().await?;
                     let epoch = barrier.epoch;
                     let update_vnode_bitmap = barrier.as_update_vnode_bitmap(self.ctx.id);
                     let post_commit = self.pk_index_state_table.commit(epoch).await?;
 
-                    // TODO: commit the writer metadata
+                    if let Some(metadata) = metadata
+                        && metadata.metadata.is_some()
+                    {
+                        self.local_barrier_manager.report_iceberg_v3_sink_metadata(
+                            epoch,
+                            self.sink_id,
+                            self.ctx.id,
+                            PbIcebergV3SinkRole::Writer,
+                            Some(metadata),
+                        );
+                    }
 
                     yield Message::Barrier(barrier);
 
@@ -304,6 +333,7 @@ mod tests {
     use iceberg::writer::PositionDeleteInput;
     use risingwave_common::array::Op;
     use risingwave_common::catalog::{ColumnDesc, ColumnId, Field, Schema, TableId};
+    use risingwave_common::id::SinkId;
     use risingwave_common::test_prelude::StreamChunkTestExt;
     use risingwave_common::types::DataType;
     use risingwave_common::util::epoch::test_epoch;
@@ -313,6 +343,7 @@ mod tests {
     use super::*;
     use crate::common::table::test_utils::gen_pbtable;
     use crate::executor::test_utils::{MessageSender, MockSource, StreamExecutorTestExt};
+    use crate::task::LocalBarrierManager;
 
     const CHUNK_SIZE: usize = 1024;
     const TEST_FILE_PATH: &str = "file1.parquet";
@@ -356,7 +387,7 @@ mod tests {
             Ok(positions)
         }
 
-        async fn flush(&mut self) -> StreamExecutorResult<Option<IcebergWriterFlushOutput>> {
+        async fn flush(&mut self) -> StreamExecutorResult<Option<SinkMetadata>> {
             Ok(None)
         }
     }
@@ -419,6 +450,7 @@ mod tests {
 
             let (tx, source) = MockSource::channel();
             let source = source.into_executor(input_schema(), vec![0]);
+            let lbm = LocalBarrierManager::for_test();
             let executor = WriterExecutor::new(
                 ActorContext::for_test(123),
                 source,
@@ -427,6 +459,8 @@ mod tests {
                 writer,
                 CHUNK_SIZE,
                 true,
+                SinkId::new(0),
+                lbm,
             )
             .boxed()
             .execute();

@@ -374,9 +374,48 @@ impl GlobalBarrierWorkerContextImpl {
                 .catalog_controller
                 .list_sink_ids(Some(database_id))
                 .await?;
-            self.sink_manager.stop_sink_coordinator(sink_ids).await;
+            self.sink_manager
+                .stop_sink_coordinator(sink_ids.clone())
+                .await;
+            self.iceberg_v3_sink_manager
+                .unregister_v3_sinks(sink_ids)
+                .await;
         } else {
             self.sink_manager.reset().await;
+            self.iceberg_v3_sink_manager.reset().await;
+        }
+        Ok(())
+    }
+
+    /// Re-register iceberg V3 sink commit workers after recovery wipes
+    /// them. Called from the recovery setup path so workers exist before
+    /// barrier-driven epoch processing resumes.
+    async fn reregister_iceberg_v3_sinks(&self, database_id: Option<DatabaseId>) -> MetaResult<()> {
+        let pb_sinks = self
+            .metadata_manager
+            .catalog_controller
+            .list_sinks()
+            .await?;
+        for pb_sink in pb_sinks {
+            if let Some(db_id) = database_id
+                && pb_sink.database_id != db_id
+            {
+                continue;
+            }
+            if !crate::manager::iceberg_v3_sink::is_iceberg_v3_sink(&pb_sink.properties) {
+                continue;
+            }
+            let config = crate::manager::iceberg_v3_sink::build_iceberg_config(&pb_sink)
+                .with_context(|| {
+                    format!(
+                        "build iceberg config while re-registering v3 sink {}",
+                        pb_sink.id
+                    )
+                })?;
+            self.iceberg_v3_sink_manager
+                .register_v3_sink(pb_sink.id, config)
+                .await
+                .with_context(|| format!("re-register v3 sink {} after recovery", pb_sink.id))?;
         }
         Ok(())
     }
@@ -713,6 +752,13 @@ impl GlobalBarrierWorkerContextImpl {
                         .await
                         .context("abort dirty pending sink state")?;
 
+                    // We must abort dirty pending sink state before registering iceberg V3 sinks,
+                    // otherwise recover_pending will take speculative (epoch > committed epoch) pending sink state
+                    // as valid and cause duplicated iceberg commit.
+                    self.reregister_iceberg_v3_sinks(None)
+                        .await
+                        .context("re-register iceberg v3 sinks after recovery")?;
+
                     // Background job progress needs to be recovered.
                     tracing::info!("recovering background job progress");
                     let initial_background_jobs = self
@@ -877,6 +923,9 @@ impl GlobalBarrierWorkerContextImpl {
         self.abort_dirty_pending_sink_state(Some(database_id))
             .await
             .context("abort dirty pending sink state")?;
+        self.reregister_iceberg_v3_sinks(Some(database_id))
+            .await
+            .context("re-register iceberg v3 sinks after recovery")?;
 
         // Background job progress needs to be recovered.
         tracing::info!(

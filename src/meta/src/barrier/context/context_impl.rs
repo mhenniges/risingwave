@@ -16,18 +16,21 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use anyhow::Context;
+use futures::StreamExt;
+use futures::stream::FuturesUnordered;
 use risingwave_common::catalog::{DatabaseId, FragmentTypeFlag, TableId};
-use risingwave_common::id::JobId;
+use risingwave_common::id::{JobId, SinkId};
 use risingwave_meta_model::ActorId;
 use risingwave_meta_model::streaming_job::BackfillOrders;
 use risingwave_pb::common::WorkerNode;
 use risingwave_pb::hummock::HummockVersionStats;
 use risingwave_pb::id::SourceId;
 use risingwave_pb::stream_service::barrier_complete_response::{
-    PbListFinishedSource, PbLoadFinishedSource,
+    PbIcebergV3SinkMetadata, PbListFinishedSource, PbLoadFinishedSource,
 };
 use risingwave_pb::stream_service::streaming_control_stream_request::PbInitRequest;
 use risingwave_rpc_client::StreamingControlHandle;
+use thiserror_ext::AsReport;
 
 use crate::barrier::cdc_progress::CdcTableBackfillTracker;
 use crate::barrier::command::{PostCollectCommand, ResumeBackfillTarget};
@@ -241,6 +244,138 @@ impl GlobalBarrierWorkerContext for GlobalBarrierWorkerContextImpl {
 
         Ok(())
     }
+
+    #[await_tree::instrument]
+    async fn pre_commit_iceberg_v3_sink_metadata(
+        &self,
+        reports: Vec<PbIcebergV3SinkMetadata>,
+    ) -> MetaResult<Vec<SinkId>> {
+        let grouped = group_v3_reports_by_sink(reports)?;
+        let success_ids: Vec<SinkId> = grouped.keys().cloned().collect();
+        let ack_futs = FuturesUnordered::new();
+        for (sink_id, (prev_epoch, reports)) in grouped {
+            if reports.is_empty() {
+                continue;
+            }
+            // Errors here happen before any oneshot is in flight, so it's safe to `?`.
+            let rx = self
+                .iceberg_v3_sink_manager
+                .pre_commit_v3_epoch(sink_id, prev_epoch, reports)
+                .await?;
+            // Pair each receiver with its sink_id so we can report failures per-sink.
+            ack_futs.push(async move { (sink_id, rx.await) });
+        }
+
+        // Drain all in-flight receivers regardless of individual failures, so that no
+        // worker is left with state inconsistent vs. the caller's view.
+        let results: Vec<(SinkId, anyhow::Result<()>)> = ack_futs
+            .map(|(sink_id, recv)| {
+                let flat = recv
+                    .with_context(|| {
+                        format!(
+                            "oneshot ack failed for iceberg v3 sink {} pre-commit",
+                            sink_id
+                        )
+                    })
+                    .and_then(|inner| inner);
+                (sink_id, flat)
+            })
+            .collect()
+            .await;
+
+        let errs: Vec<(SinkId, anyhow::Error)> = results
+            .into_iter()
+            .filter_map(|(id, r)| r.err().map(|e| (id, e)))
+            .collect();
+
+        if errs.is_empty() {
+            Ok(success_ids)
+        } else {
+            Err(aggregate_v3_sink_errors("pre-commit", errs).into())
+        }
+    }
+
+    #[await_tree::instrument]
+    async fn commit_iceberg_v3_sink_metadata(&self, sink_ids: Vec<SinkId>) -> MetaResult<()> {
+        let ack_futs = FuturesUnordered::new();
+        for sink_id in sink_ids {
+            // Errors here happen before any oneshot is in flight, so it's safe to `?`.
+            let rx = self
+                .iceberg_v3_sink_manager
+                .commit_v3_epoch(sink_id)
+                .await?;
+            ack_futs.push(async move { (sink_id, rx.await) });
+        }
+
+        // Drain all receivers before returning, then aggregate any failures.
+        let results: Vec<(SinkId, anyhow::Result<()>)> = ack_futs
+            .map(|(sink_id, recv)| {
+                let flat = recv
+                    .with_context(|| {
+                        format!("oneshot ack failed for iceberg v3 sink {} commit", sink_id)
+                    })
+                    .and_then(|inner| inner);
+                (sink_id, flat)
+            })
+            .collect()
+            .await;
+
+        let errs: Vec<(SinkId, anyhow::Error)> = results
+            .into_iter()
+            .filter_map(|(id, r)| r.err().map(|e| (id, e)))
+            .collect();
+
+        if errs.is_empty() {
+            Ok(())
+        } else {
+            Err(aggregate_v3_sink_errors("commit", errs).into())
+        }
+    }
+}
+
+/// Combine per-sink errors from a fan-out into a single `anyhow::Error`. The first failing
+/// sink's error is used as the source so the original chain is preserved; the message lists
+/// every failing `sink_id` and its error stringified.
+fn aggregate_v3_sink_errors(
+    phase: &'static str,
+    mut errs: Vec<(SinkId, anyhow::Error)>,
+) -> anyhow::Error {
+    debug_assert!(!errs.is_empty());
+    let sink_ids: Vec<String> = errs.iter().map(|(id, _)| id.to_string()).collect();
+    let details: Vec<String> = errs
+        .iter()
+        .map(|(id, e)| format!("sink {}: {}", id, e.as_report()))
+        .collect();
+    // Preserve the first error's chain as the cause.
+    let (_first_id, first_err) = errs.remove(0);
+    first_err.context(format!(
+        "iceberg v3 sink {} failed for sink_id(s) [{}]: {}",
+        phase,
+        sink_ids.join(", "),
+        details.join("; ")
+    ))
+}
+
+fn group_v3_reports_by_sink(
+    reports: Vec<PbIcebergV3SinkMetadata>,
+) -> MetaResult<HashMap<SinkId, (u64, Vec<PbIcebergV3SinkMetadata>)>> {
+    let mut grouped: HashMap<SinkId, (u64, Vec<PbIcebergV3SinkMetadata>)> = HashMap::new();
+    for r in reports {
+        let sink_id = r.sink_id;
+        let prev_epoch = r.prev_epoch;
+        let entry = grouped.entry(sink_id).or_insert((prev_epoch, Vec::new()));
+        if entry.0 != prev_epoch {
+            return Err(anyhow::anyhow!(
+                "iceberg v3 sink {} reports disagree on prev_epoch: {} vs {}",
+                sink_id,
+                entry.0,
+                prev_epoch
+            )
+            .into());
+        }
+        entry.1.push(r);
+    }
+    Ok(grouped)
 }
 
 impl GlobalBarrierWorkerContextImpl {

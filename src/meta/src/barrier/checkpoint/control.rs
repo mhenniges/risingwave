@@ -1092,6 +1092,16 @@ impl DatabaseCheckpointControl {
             task.refresh_finished_table_job_ids
                 .extend(refresh_finished_table_ids);
         }
+
+        let iceberg_v3_sink_metadata = resps
+            .values()
+            .flat_map(|resp| resp.iceberg_v3_sink_metadata.clone())
+            .collect::<Vec<_>>();
+        if !iceberg_v3_sink_metadata.is_empty() {
+            let task = task.get_or_insert_default();
+            task.iceberg_v3_sink_metadata
+                .extend(iceberg_v3_sink_metadata);
+        }
     }
 }
 
