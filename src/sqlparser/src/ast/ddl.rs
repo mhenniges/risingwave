@@ -17,7 +17,7 @@ use std::fmt;
 
 use super::{ConfigParam, FormatEncodeOptions, SqlOption};
 use crate::ast::{
-    DataType, Expr, Ident, ObjectName, Query, SecretRefValue, SetVariableValue, Value,
+    DataType, Expr, Ident, ObjectName, OnConflict, Query, SecretRefValue, SetVariableValue, Value,
     display_comma_separated, display_separated,
 };
 use crate::tokenizer::Token;
@@ -127,6 +127,15 @@ pub enum AlterTableOperation {
     /// `SET DML_RATE_LIMIT TO <rate_limit>`
     SetDmlRateLimit {
         rate_limit: i32,
+    },
+    /// `SET ON CONFLICT { DO UPDATE FULL | DO NOTHING | DO UPDATE IF NOT NULL }`
+    ///
+    /// Changes the table's PK conflict-resolution behavior in place, preserving
+    /// existing data. The underlying mechanism is the same `replace_table` flow
+    /// used by `ALTER TABLE ADD COLUMN`, with the table's stored `CREATE TABLE`
+    /// definition rewritten so the new `on_conflict` clause is re-planned.
+    SetOnConflict {
+        on_conflict: OnConflict,
     },
     /// `SWAP WITH <table_name>`
     SwapRenameTable {
@@ -495,6 +504,9 @@ impl fmt::Display for AlterTableOperation {
             }
             AlterTableOperation::SetDmlRateLimit { rate_limit } => {
                 write!(f, "SET DML_RATE_LIMIT TO {}", rate_limit)
+            }
+            AlterTableOperation::SetOnConflict { on_conflict } => {
+                write!(f, "SET ON CONFLICT {}", on_conflict)
             }
             AlterTableOperation::SwapRenameTable { target_table } => {
                 write!(f, "SWAP WITH {}", target_table)

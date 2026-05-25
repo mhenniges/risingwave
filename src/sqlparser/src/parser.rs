@@ -3340,9 +3340,16 @@ impl Parser<'_> {
             } else if self.parse_keyword(Keyword::CONFIG) {
                 let entries = self.parse_options()?;
                 AlterTableOperation::SetConfig { entries }
+            } else if self.parse_keywords(&[Keyword::ON, Keyword::CONFLICT]) {
+                let Some(on_conflict) = self.parse_handle_conflict_behavior()? else {
+                    return self.expected(
+                        "DO UPDATE FULL, DO NOTHING, or DO UPDATE IF NOT NULL after SET ON CONFLICT",
+                    );
+                };
+                AlterTableOperation::SetOnConflict { on_conflict }
             } else {
                 return self.expected(
-                    "SCHEMA/PARALLELISM/BACKFILL_PARALLELISM/SOURCE_RATE_LIMIT/DML_RATE_LIMIT/CONFIG after SET",
+                    "SCHEMA/PARALLELISM/BACKFILL_PARALLELISM/SOURCE_RATE_LIMIT/DML_RATE_LIMIT/CONFIG/ON CONFLICT after SET",
                 );
             }
         } else if self.parse_keyword(Keyword::RESET) {

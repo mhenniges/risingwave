@@ -65,6 +65,7 @@ mod alter_system;
 mod alter_table_column;
 pub mod alter_table_drop_connector;
 pub mod alter_table_props;
+mod alter_table_set_on_conflict;
 mod alter_table_with_sr;
 pub mod alter_user;
 mod alter_utils;
@@ -936,6 +937,16 @@ pub async fn handle(
                 )
                 .await
             }
+            AlterTableOperation::SetOnConflict { on_conflict } => {
+                Box::pin(
+                    alter_table_set_on_conflict::handle_alter_table_set_on_conflict(
+                        handler_args,
+                        name,
+                        on_conflict,
+                    ),
+                )
+                .await
+            }
             AlterTableOperation::SetConfig { entries } => {
                 alter_streaming_config::handle_alter_streaming_set_config(
                     handler_args,
@@ -1723,6 +1734,13 @@ fn check_ban_alter_table_operation_for_iceberg_engine_table(
         AlterTableOperation::RefreshSchema => {
             bail!(
                 "ALTER TABLE REFRESH SCHEMA is not supported for iceberg table: {}.{}",
+                schema_name,
+                table_name
+            );
+        }
+        AlterTableOperation::SetOnConflict { .. } => {
+            bail!(
+                "ALTER TABLE SET ON CONFLICT is not supported for iceberg table: {}.{}",
                 schema_name,
                 table_name
             );

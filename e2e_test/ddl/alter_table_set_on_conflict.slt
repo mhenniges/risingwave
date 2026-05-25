@@ -1,0 +1,198 @@
+statement ok
+SET RW_IMPLICIT_FLUSH TO true;
+
+# ----- Basic transitions preserve data -----
+
+statement ok
+create table t (k int primary key, v1 int, v2 int);
+
+statement ok
+insert into t values (1, 10, 100), (2, 20, 200), (3, 30, 300);
+
+query III rowsort
+select k, v1, v2 from t;
+----
+1 10 100
+2 20 200
+3 30 300
+
+# Default is `DO UPDATE FULL` (Overwrite). Switch to DO UPDATE IF NOT NULL.
+statement ok
+alter table t set on conflict do update if not null;
+
+# Data is preserved.
+query III rowsort
+select k, v1, v2 from t;
+----
+1 10 100
+2 20 200
+3 30 300
+
+# `definition` in rw_tables reflects the new ON CONFLICT clause.
+query T
+select definition from rw_catalog.rw_tables where name = 't';
+----
+CREATE TABLE t (k INT PRIMARY KEY, v1 INT, v2 INT) ON CONFLICT DO UPDATE IF NOT NULL
+
+# New behavior takes effect: conflicting insert with NULL v2 should keep old v2.
+statement ok
+insert into t values (1, 99, NULL);
+
+query III rowsort
+select k, v1, v2 from t;
+----
+1 99 100
+2 20 200
+3 30 300
+
+# Switch to DO NOTHING - data still preserved.
+statement ok
+alter table t set on conflict do nothing;
+
+query III rowsort
+select k, v1, v2 from t;
+----
+1 99 100
+2 20 200
+3 30 300
+
+# DO NOTHING: conflicting insert is silently ignored.
+statement ok
+insert into t values (1, 77, 77), (4, 40, 400);
+
+query III rowsort
+select k, v1, v2 from t;
+----
+1 99 100
+2 20 200
+3 30 300
+4 40 400
+
+# Switch back to DO UPDATE FULL (Overwrite).
+statement ok
+alter table t set on conflict do update full;
+
+# DO UPDATE FULL: conflicting insert replaces the row entirely.
+statement ok
+insert into t values (1, 1, 1);
+
+query III rowsort
+select k, v1, v2 from t;
+----
+1 1 1
+2 20 200
+3 30 300
+4 40 400
+
+statement ok
+drop table t;
+
+# ----- Compatibility aliases (OVERWRITE / IGNORE) work -----
+# `OVERWRITE` is an alias for `DO UPDATE FULL`; `IGNORE` is an alias for
+# `DO NOTHING`. The Display impl normalises to the canonical form.
+
+statement ok
+create table t (k int primary key, v int) on conflict do update if not null;
+
+statement ok
+alter table t set on conflict overwrite;
+
+query T
+select definition from rw_catalog.rw_tables where name = 't';
+----
+CREATE TABLE t (k INT PRIMARY KEY, v INT) ON CONFLICT DO UPDATE FULL
+
+statement ok
+alter table t set on conflict ignore;
+
+query T
+select definition from rw_catalog.rw_tables where name = 't';
+----
+CREATE TABLE t (k INT PRIMARY KEY, v INT) ON CONFLICT DO NOTHING
+
+statement ok
+drop table t;
+
+# ----- No-op fast path: same value is a no-op (no error) -----
+
+statement ok
+create table t (k int primary key, v int) on conflict do update if not null;
+
+statement ok
+alter table t set on conflict do update if not null;
+
+statement ok
+drop table t;
+
+# ----- Error cases -----
+
+# Append-only tables cannot have ON CONFLICT altered.
+statement ok
+create table ao (k int primary key, v int) append only on conflict do nothing;
+
+statement error cannot change ON CONFLICT behavior on append-only tables
+alter table ao set on conflict do update if not null;
+
+statement ok
+drop table ao;
+
+# Append-only table with row_id PK also rejected.
+statement ok
+create table ao_rowid (v int) append only;
+
+statement error cannot change ON CONFLICT behavior on append-only tables
+alter table ao_rowid set on conflict do update if not null;
+
+statement ok
+drop table ao_rowid;
+
+# Altering a non-existent table errors.
+statement error
+alter table no_such_table set on conflict do nothing;
+
+# Parser error: must specify a behavior after SET ON CONFLICT.
+statement error
+alter table t set on conflict;
+
+# ----- Works with downstream MVs (data preserved, MV continues to function) -----
+
+statement ok
+create table t (k int primary key, v int);
+
+statement ok
+insert into t values (1, 10), (2, 20);
+
+statement ok
+create materialized view mv as select k, v from t;
+
+query II rowsort
+select k, v from mv;
+----
+1 10
+2 20
+
+statement ok
+alter table t set on conflict do update if not null;
+
+# MV should still reflect the table contents.
+query II rowsort
+select k, v from mv;
+----
+1 10
+2 20
+
+# New conflict behavior takes effect even with the MV downstream.
+statement ok
+insert into t values (1, NULL);
+
+query II rowsort
+select k, v from mv;
+----
+1 10
+2 20
+
+statement ok
+drop materialized view mv;
+
+statement ok
+drop table t;
