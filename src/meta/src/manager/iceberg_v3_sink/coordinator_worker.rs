@@ -204,6 +204,9 @@ impl IcebergV3CoordinatorWorker {
 
     /// Read every persisted row for this sink, recovery `prev_committed_epoch` and pending commits.
     async fn recovery(&self) -> Result<(Option<u64>, Vec<EpochCommit>)> {
+        fail::fail_point!("iceberg_v3_recovery_fail", |_| Err(anyhow::anyhow!(
+            "injected: iceberg_v3_recovery_fail"
+        )));
         let rows = list_sink_states_ordered_by_epoch(&self.db, self.sink_id)
             .await
             .context("list pending sink states for v3 recovery")?;
